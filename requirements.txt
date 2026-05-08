@@ -1,0 +1,391 @@
+"""
+dqn_agent.py — Deep Q-Network Agent for RPOD
+=============================================
+Implements Double DQN with Prioritized Experience Replay (PER)
+for discrete-action spacecraft maneuvering.
+
+References:
+  Mnih et al. (2015). Human-level control through deep reinforcement learning.
+    Nature, 518, 529–533.
+  van Hasselt et al. (2016). Deep Reinforcement Learning with Double Q-Learning.
+    AAAI 2016.
+  Schaul et al. (2016). Prioritized Experience Replay. ICLR 2016.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from collections import deque, namedtuple
+import random
+import os
+from typing import List, Tuple, Optional, Dict
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ── Device ────────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Discrete action set (thrust combinations)
+# Each action is a 3-tuple (ax, ay, az) as multiples of max_thrust
+_T = 1.0   # normalised thrust magnitude
+DISCRETE_ACTIONS = [
+    ( 0,  0,  0),   # 0: coast
+    (+_T, 0,  0),   # 1: +X thrust
+    (-_T, 0,  0),   # 2: −X thrust
+    ( 0, +_T, 0),   # 3: +Y thrust
+    ( 0, -_T, 0),   # 4: −Y thrust
+    ( 0,  0, +_T),  # 5: +Z thrust
+    ( 0,  0, -_T),  # 6: −Z thrust
+    (+_T,+_T, 0),   # 7: diagonal XY
+    (-_T,-_T, 0),   # 8: diagonal −XY
+    (+_T, 0, +_T),  # 9: diagonal XZ
+    (-_T, 0, -_T),  # 10: diagonal −XZ
+]
+N_ACTIONS = len(DISCRETE_ACTIONS)
+
+Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
+
+
+# ── Neural Network Architecture ───────────────────────────────────────────────
+
+class NoisyLinear(nn.Module):
+    """NoisyNet linear layer for parameter-space exploration."""
+    def __init__(self, in_features: int, out_features: int, sigma_init: float = 0.5):
+        super().__init__()
+        self.in_f  = in_features
+        self.out_f = out_features
+        self.sigma_init = sigma_init
+
+        self.weight_mu    = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+
+        self.bias_mu    = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+
+        self.reset_parameters()
+        self.sample_noise()
+
+    def reset_parameters(self):
+        mu_range = 1.0 / np.sqrt(self.in_f)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.sigma_init / np.sqrt(self.in_f))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(self.sigma_init / np.sqrt(self.out_f))
+
+    @staticmethod
+    def _scale_noise(n: int) -> torch.Tensor:
+        x = torch.randn(n)
+        return x.sign() * x.abs().sqrt()
+
+    def sample_noise(self):
+        eps_p = self._scale_noise(self.in_f)
+        eps_q = self._scale_noise(self.out_f)
+        self.weight_epsilon.copy_(eps_q.outer(eps_p))
+        self.bias_epsilon.copy_(eps_q)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            b = self.bias_mu   + self.bias_sigma   * self.bias_epsilon
+        else:
+            w = self.weight_mu
+            b = self.bias_mu
+        return F.linear(x, w, b)
+
+
+class DuelingDQNNetwork(nn.Module):
+    """
+    Dueling Double DQN with NoisyNet layers.
+    Architecture: shared encoder → [value stream | advantage stream]
+    Q(s,a) = V(s) + A(s,a) − mean(A(s,·))
+    """
+    def __init__(self, obs_dim: int, n_actions: int, hidden: List[int] = None):
+        super().__init__()
+        hidden = hidden or [256, 256, 128]
+
+        # Shared feature extractor
+        layers = []
+        in_dim = obs_dim
+        for h in hidden[:-1]:
+            layers += [nn.Linear(in_dim, h), nn.LayerNorm(h), nn.ELU()]
+            in_dim = h
+        self.feature = nn.Sequential(*layers)
+
+        feat_dim = in_dim
+
+        # Value stream  V(s) ∈ ℝ
+        self.value_stream = nn.Sequential(
+            NoisyLinear(feat_dim, hidden[-1]),
+            nn.ELU(),
+            NoisyLinear(hidden[-1], 1),
+        )
+
+        # Advantage stream  A(s,a) ∈ ℝⁿ
+        self.advantage_stream = nn.Sequential(
+            NoisyLinear(feat_dim, hidden[-1]),
+            nn.ELU(),
+            NoisyLinear(hidden[-1], n_actions),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.feature(x)
+        V    = self.value_stream(feat)                  # (B, 1)
+        A    = self.advantage_stream(feat)              # (B, n_actions)
+        Q    = V + (A - A.mean(dim=1, keepdim=True))   # Dueling aggregation
+        return Q
+
+    def sample_noise(self):
+        for m in self.modules():
+            if isinstance(m, NoisyLinear):
+                m.sample_noise()
+
+
+# ── Prioritized Replay Buffer ─────────────────────────────────────────────────
+
+class PrioritizedReplayBuffer:
+    """
+    Prioritized Experience Replay with sum-tree for O(log n) sampling.
+    Priority p_i = |δ_i|^α  where δ_i is the TD error.
+    Importance-sampling weight w_i = (N · P(i))^{−β} / max w_j
+    """
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4,
+                 beta_anneal_steps: int = 100_000):
+        self.capacity = capacity
+        self.alpha    = alpha
+        self.beta     = beta
+        self.beta_max = 1.0
+        self.beta_increment = (self.beta_max - beta) / beta_anneal_steps
+
+        self._data: List[Optional[Transition]] = [None] * capacity
+        self._priorities = np.zeros(capacity, dtype=np.float32)
+        self._pos = 0
+        self._size = 0
+        self._max_priority = 1.0
+
+    def push(self, *args):
+        self._data[self._pos] = Transition(*args)
+        self._priorities[self._pos] = self._max_priority
+        self._pos  = (self._pos + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def sample(self, batch_size: int) -> Tuple:
+        probs = self._priorities[:self._size] ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(self._size, batch_size, replace=False, p=probs)
+        weights = (self._size * probs[indices]) ** (-self.beta)
+        weights /= weights.max()
+        self.beta = min(self.beta_max, self.beta + self.beta_increment)
+
+        batch = [self._data[i] for i in indices]
+        states      = torch.FloatTensor([t.state      for t in batch]).to(DEVICE)
+        actions     = torch.LongTensor( [t.action     for t in batch]).to(DEVICE)
+        rewards     = torch.FloatTensor([t.reward     for t in batch]).to(DEVICE)
+        next_states = torch.FloatTensor([t.next_state for t in batch]).to(DEVICE)
+        dones       = torch.FloatTensor([t.done       for t in batch]).to(DEVICE)
+        weights_t   = torch.FloatTensor(weights).to(DEVICE)
+
+        return indices, (states, actions, rewards, next_states, dones), weights_t
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
+        priorities = (np.abs(td_errors) + 1e-6) ** self.alpha
+        self._priorities[indices] = priorities
+        self._max_priority = max(self._max_priority, priorities.max())
+
+    def __len__(self):
+        return self._size
+
+
+# ── DQN Agent ─────────────────────────────────────────────────────────────────
+
+class DQNAgent:
+    """
+    Double Dueling DQN Agent with Prioritized Experience Replay and NoisyNets.
+
+    Hyper-parameters:
+        lr              : Adam learning rate
+        gamma           : discount factor
+        tau             : soft target-network update rate
+        batch_size      : mini-batch size
+        buffer_size     : replay buffer capacity
+        learn_every     : update frequency (steps)
+        target_update   : hard target update frequency (steps)
+        max_thrust      : physical thrust limit (m/s²) from env config
+
+    Usage:
+        agent = DQNAgent(obs_dim=18, max_thrust=0.003)
+        action_vec = agent.act(obs)            # returns continuous [ax,ay,az]
+        agent.step(obs, action_idx, rew, next_obs, done)
+        metrics = agent.learn()
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 18,
+        n_actions: int = N_ACTIONS,
+        max_thrust: float = 0.003,
+        lr: float = 3e-4,
+        gamma: float = 0.995,
+        tau: float = 5e-3,
+        batch_size: int = 128,
+        buffer_size: int = 200_000,
+        learn_every: int = 4,
+        target_update: int = 1000,
+        hidden: Optional[List[int]] = None,
+    ):
+        self.obs_dim    = obs_dim
+        self.n_actions  = n_actions
+        self.max_thrust = max_thrust
+        self.gamma      = gamma
+        self.tau        = tau
+        self.batch_size = batch_size
+        self.learn_every  = learn_every
+        self.target_update = target_update
+
+        # Networks
+        self.policy_net = DuelingDQNNetwork(obs_dim, n_actions, hidden).to(DEVICE)
+        self.target_net = DuelingDQNNetwork(obs_dim, n_actions, hidden).to(DEVICE)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr, eps=1e-5)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500_000)
+
+        self.memory = PrioritizedReplayBuffer(buffer_size)
+
+        self._t_step  = 0
+        self._episode = 0
+        self.losses: deque = deque(maxlen=100)
+        self.q_values: deque = deque(maxlen=100)
+
+        # Discrete → continuous action lookup
+        self._action_table = (
+            np.array(DISCRETE_ACTIONS, dtype=np.float32) * max_thrust
+        )
+
+        logger.info(
+            f"DQN Agent initialised | obs={obs_dim} | actions={n_actions} | "
+            f"params={sum(p.numel() for p in self.policy_net.parameters()):,} | device={DEVICE}"
+        )
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def act(self, obs: np.ndarray, deterministic: bool = False) -> Tuple[np.ndarray, int]:
+        """
+        Select action using noisy network (implicit exploration).
+        Returns: (continuous thrust vector [ax,ay,az], discrete action index)
+        """
+        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
+        self.policy_net.sample_noise()
+        with torch.no_grad():
+            q = self.policy_net(obs_t)
+        action_idx = int(q.argmax(dim=1).item())
+        self.q_values.append(float(q.max().item()))
+        return self._action_table[action_idx].copy(), action_idx
+
+    def step(
+        self,
+        obs: np.ndarray,
+        action_idx: int,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+    ) -> Optional[Dict[str, float]]:
+        """Store transition and trigger learning if ready."""
+        self.memory.push(obs, action_idx, reward, next_obs, float(done))
+        self._t_step += 1
+
+        metrics = None
+        if (len(self.memory) >= self.batch_size and
+                self._t_step % self.learn_every == 0):
+            metrics = self.learn()
+
+        if self._t_step % self.target_update == 0:
+            self._hard_update_target()
+
+        return metrics
+
+    def learn(self) -> Dict[str, float]:
+        """Sample a batch and perform one gradient update."""
+        indices, (states, actions, rewards, next_states, dones), weights = \
+            self.memory.sample(self.batch_size)
+
+        # ── Double DQN target ─────────────────────────────────────────────
+        with torch.no_grad():
+            # Action selection: policy network
+            next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
+            # Action evaluation: target network
+            next_q = self.target_net(next_states).gather(1, next_actions).squeeze()
+            targets = rewards + self.gamma * next_q * (1.0 - dones)
+
+        # ── Current Q ─────────────────────────────────────────────────────
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze()
+
+        # ── Huber loss (robust to outliers) ──────────────────────────────
+        td_errors = (targets - current_q).detach().cpu().numpy()
+        loss = (weights * F.smooth_l1_loss(current_q, targets, reduction="none")).mean()
+
+        # ── Backprop ──────────────────────────────────────────────────────
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        self.scheduler.step()
+
+        # ── Update priorities ─────────────────────────────────────────────
+        self.memory.update_priorities(indices, td_errors)
+
+        # ── Soft target update ────────────────────────────────────────────
+        self._soft_update_target()
+
+        loss_val = float(loss.item())
+        self.losses.append(loss_val)
+
+        return {
+            "loss": loss_val,
+            "mean_q": float(np.mean(list(self.q_values))) if self.q_values else 0.0,
+            "lr": self.scheduler.get_last_lr()[0],
+        }
+
+    def end_episode(self):
+        """Call at episode end to resample NoisyNet parameters."""
+        self._episode += 1
+        self.policy_net.sample_noise()
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            "policy_state": self.policy_net.state_dict(),
+            "target_state": self.target_net.state_dict(),
+            "optimizer":    self.optimizer.state_dict(),
+            "t_step":       self._t_step,
+            "episode":      self._episode,
+        }, path)
+        logger.info(f"DQN checkpoint saved → {path}")
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=DEVICE)
+        self.policy_net.load_state_dict(ckpt["policy_state"])
+        self.target_net.load_state_dict(ckpt["target_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self._t_step  = ckpt.get("t_step", 0)
+        self._episode = ckpt.get("episode", 0)
+        logger.info(f"DQN checkpoint loaded ← {path} (episode {self._episode})")
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _soft_update_target(self):
+        for p, tp in zip(self.policy_net.parameters(), self.target_net.parameters()):
+            tp.data.copy_(self.tau * p.data + (1.0 - self.tau) * tp.data)
+
+    def _hard_update_target(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    @property
+    def mean_loss(self) -> float:
+        return float(np.mean(list(self.losses))) if self.losses else 0.0
